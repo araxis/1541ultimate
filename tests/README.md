@@ -82,13 +82,22 @@ from. A target occupies the machines it names, and two targets that share one
 never run at the same time: `u64` and `u2@c64u` run together, while `c64u` and
 `u2@c64u` take turns. `-o DIR` gives each target a subdirectory of its own.
 
-A bench where a cartridge is permanently in one computer can say so once
-instead of spelling it out on every command line:
+The runner finds which cartridge is in which computer, and nothing has to be
+set. Before it starts, it takes the pairs written as `cartridge@computer`. It
+then checks every cartridge named beside other hosts: the computer writes a
+random 8-byte fingerprint into its own RAM at `$0340`, and the cartridge
+reads that address through its own DMA, so only the computer it is plugged
+into returns the same bytes. A computer that has no cartridge declared is
+also searched for one on its /24 network, because a cartridge nobody named
+still shares that computer's IEC bus. The result is reported as a `cabling:`
+line and exported as `U64_COMPUTERS`.
 
 ```sh
-export U64_COMPUTERS=u2@c64u
-./run-tests u2 c64u          # u2 means the u2 in the c64u, so these take turns
+./run-tests u2 c64u          # u2 is found to be in the c64u, so these take turns
 ```
+
+`U64_COMPUTERS=u2@c64u` states the cabling instead of measuring it, and wins
+over a measurement.
 
 Two tokens that name the same pair of machines are one target: with that
 variable set, `./run-tests u2@c64u c64u u2` runs two targets and says it
@@ -187,7 +196,7 @@ when a suite is started by hand. One name each, used by every suite:
 | `U64_TELNET_PORT` | Telnet port for the UI transport | `23` |
 | `U64_DMA_PORT` | DMA control port | `64` |
 | `U64_MODE` | Default UI mode: `overlay`, `freeze` or `telnet` | `overlay` |
-| `U64_COMPUTERS` | Which computer each cartridge is plugged into, as `u2@c64u[,...]` | none |
+| `U64_COMPUTERS` | Which computer each cartridge is plugged into, as `u2@c64u[,...]`. Optional: the runner measures it when unset | measured |
 
 `tests/lib/pacing.py` documents the `U64_UI_*` variables that change how fast
 the suites drive the on-device UI.
@@ -289,8 +298,18 @@ e2e:
   freezer-audio                     .      x      x      x      x
   ftp-client                        .      x      x      x      x
   ftp-server                        x      x      x      x      x
+  gmod2-eeprom-dirty                .      .      x      x      x
+  https-diagnostic                  .      .      .      x      x
+  https-harness                     .      x      x      x      x
+  https-lifecycle                   .      .      .      x      x
+  https-response                    .      .      .      x      x
+  https-smoke                       .      .      .      x      x
+  https-wifi-loss                   .      .      .      x      x
   ident-service-switch              .      .      x      x      x
   iec-dos-commands                  .      .      x      x      x
+  iec-partition-file                .      .      x      x      x
+  softiec-log-lines                 .      .      x      x      x
+  iec-listen-timing                 .      .      x      x      x
   input                             x      x      x      x      x
   input-batching                    x      x      x      x      x
   key-injection                     .      .      x      x      x
@@ -314,6 +333,7 @@ e2e:
   reu-turbo                         .      .      x      x      x
   runner-policy                     .      x      x      x      x
   stale-gates                       .      x      x      x      x
+  tape-playback                     .      .      x      x      x
   telnet-drain                      .      x      x      x      x
   telnet-stale-session              .      .      .      x      x
   telnet-sustained-input            .      .      .      x      x
@@ -341,17 +361,20 @@ soak:
   assembly-search-leak              .      .      x      x      x
   browser-refresh-leak              .      .      x      x      x
   heap-leak                         .      .      x      x      x
+  https-repetition                  .      .      .      x      x
+  https-timed                       .      .      .      x      x
   ident-leak                        .      .      x      x      x
   listener-soak                     .      .      x      x      x
   menu-navigation                   .      .      x      x      x
   mount-cache-leak                  .      .      x      x      x
   network-connection                .      .      x      x      x
   prg-context-menu-leak             .      .      x      x      x
+  softiec-soak                      .      .      x      x      x
   usb-keyboard-repeat               .      .      .      x      x
 
                                ------ ------ ------ ------ ------
-  suites                           14     29     63     77     77
-  suite runs                       14     29     63    154    231
+  suites                           14     30     67     88     88
+  suite runs                       14     30     67    176    264
 
 Scenario and check counts, and durations, are not shown here:
 the registry does not know them. They depend on the machine and are

@@ -208,7 +208,7 @@ update_binaries_u64ii.o: $(FPGA_IMAGES:%=%.swp) ../ultimate/result/ultimate.app
 
 ../ultimate/result/ultimate.app::
 ifeq ($(strip $(MANAGEMENT_SHA256)),)
-	make -C ../ultimate
+	+$(MAKE) -C ../ultimate
 else
 	@printf '%s  %s\n' '$(MANAGEMENT_SHA256)' '$@' | sha256sum --check
 endif

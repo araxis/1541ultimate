@@ -6,6 +6,7 @@
  */
 
 
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "esp_wifi.h"
@@ -21,6 +22,11 @@
 #include "button_handler.h"
 #include "wifi_modem.h"
 #include "sntp.h"
+#include "provider_identity.h"
+#include "provider_boot.h"
+#include "provider_control_task.h"
+#include "recovery.h"
+#include "recovery_url.h"
 
 // not officially supported
 #include "../lwip/esp_netif_lwip_internal.h"
@@ -37,11 +43,18 @@ void cmd_echo(command_buf_t *buf)
 
 void cmd_identify(command_buf_t *buf)
 {
+    uint8_t cookie[8];
+    int extended = provider_probe_cookie(buf->data, buf->size, cookie);
     rpc_identify_resp *resp = (rpc_identify_resp *)buf->data;
     resp->major = IDENT_MAJOR;
     resp->minor = IDENT_MINOR;
     strcpy(&resp->string, IDENT_STRING);
     buf->size = sizeof(rpc_identify_resp) + strlen(&resp->string);
+    const uint8_t *boot = provider_boot_identity();
+    if (extended && boot) {
+        buf->size = provider_identity_append(buf->data, sizeof(buf->data),
+            (uint8_t *)&resp->string - buf->data + strlen(&resp->string) + 1, cookie, boot);
+    }
     my_uart_transmit_packet(UART_CHAN, buf);
 }
 
@@ -109,7 +122,9 @@ void cmd_wifi_connect(command_buf_t *buf)
     ev.command = CMD_WIFI_CONNECT;
     ev.auth_mode = param->auth_mode;
     memcpy(&ev.ssid, param->ssid, 32);
+    ev.ssid[32] = 0;
     memcpy(&ev.pw, param->password, 64);
+    ev.pw[64] = 0;
 
     if (xQueueSend(connect_commands, &ev, 1000) == pdFALSE) {
         resp->esp_err = ESP_ERR_NO_MEM;
@@ -187,10 +202,15 @@ void cmd_reboot(command_buf_t *buf)
 void cmd_modem_on(command_buf_t *buf)
 {
     rpc_espcmd_resp *resp = (rpc_espcmd_resp *)buf->data;
-    resp->esp_err = ESP_OK;
+    // While a recovery downloads through the interface, the firmware it is
+    // replacing may still run; it must not take the interface over.
+    bool refused = recovery_running();
+    resp->esp_err = refused ? ESP_ERR_INVALID_STATE : ESP_OK;
     buf->size = sizeof(rpc_espcmd_resp);
     my_uart_transmit_packet(UART_CHAN, buf);
-    enable_hook();
+    if (!refused) {
+        enable_hook();
+    }
 }
 
 void cmd_modem_off(command_buf_t *buf)
@@ -363,6 +383,33 @@ void cmd_get_wake_on_wifi(command_buf_t *buf)
     my_uart_transmit_packet(UART_CHAN, buf);
 }
 
+_Static_assert(RPC_RECOVERY_URL_LEN == RECOVERY_URL_MAX + 1, "the RPC carries a whole recovery URL");
+
+void cmd_set_recovery_url(command_buf_t *buf)
+{
+    rpc_set_recovery_url_req *param = (rpc_set_recovery_url_req *)buf->data;
+    rpc_espcmd_resp *resp = (rpc_espcmd_resp *)buf->data;
+    char url[RPC_RECOVERY_URL_LEN];
+
+    if (buf->size < (int)sizeof(rpc_set_recovery_url_req) ||
+        memchr(param->url, 0, sizeof(param->url)) == NULL) {
+        resp->esp_err = ESP_ERR_INVALID_ARG;
+    } else {
+        strcpy(url, param->url); // before the response overwrites the request
+        resp->esp_err = recovery_set_url(url);
+    }
+    buf->size = sizeof(rpc_espcmd_resp);
+    my_uart_transmit_packet(UART_CHAN, buf);
+}
+
+void cmd_get_recovery_url(command_buf_t *buf)
+{
+    rpc_get_recovery_url_resp *resp = (rpc_get_recovery_url_resp *)buf->data;
+    resp->esp_err = recovery_get_url(resp->url, sizeof(resp->url));
+    buf->size = sizeof(rpc_get_recovery_url_resp);
+    my_uart_transmit_packet(UART_CHAN, buf);
+}
+
 void cmd_not_implemented(command_buf_t *buf)
 {
     rpc_espcmd_resp *resp = (rpc_espcmd_resp *)buf->data;
@@ -418,6 +465,11 @@ void dispatch(void *ct)
         // }
         // gpio_set_level(IO_ESP_LED, 0); // ON!
         xQueueReceive(queue, &pbuffer, portMAX_DELAY); // No LED at all.
+        if (pbuffer->size < (int)sizeof(rpc_header_t) || pbuffer->size > (int)sizeof(pbuffer->data) ||
+            provider_control_receive(pbuffer->data, pbuffer->size)) {
+            my_uart_free_buffer(UART_CHAN, pbuffer);
+            continue;
+        }
 #if UART_DEBUG_RX
         printf("Received buffer %d with %d bytes.\n", pbuffer->bufnr, pbuffer->size);
 #endif
@@ -496,6 +548,12 @@ void dispatch(void *ct)
         case CMD_GET_WAKE_ON_WIFI:
             cmd_get_wake_on_wifi(pbuffer);
             break;
+        case CMD_SET_RECOVERY_URL:
+            cmd_set_recovery_url(pbuffer);
+            break;
+        case CMD_GET_RECOVERY_URL:
+            cmd_get_recovery_url(pbuffer);
+            break;
         default:
             cmd_not_implemented(pbuffer);
             break;
@@ -505,6 +563,7 @@ void dispatch(void *ct)
 
 void start_dispatch(QueueHandle_t queue)
 {
+    provider_control_start();
     xTaskCreate( dispatch, "Dispatch Task", DISPATCHER_STACK, queue, tskIDLE_PRIORITY + 1, NULL );
 }
 

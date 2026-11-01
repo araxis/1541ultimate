@@ -25,6 +25,8 @@
 #include "soc/io_mux_reg.h"
 
 #include "sntp.h"
+#include "provider_sources.h"
+#include "provider_boot.h"
 #include "rpc_calls.h"
 #include "rpc_dispatch.h"
 #include "wifi_modem.h"
@@ -32,6 +34,22 @@
 #include "power_state.h"
 #include "button_handler.h"
 #include "wol_magic.h"
+#include "recovery.h"
+
+static esp_err_t provider_wifi_start(void)
+{
+    provider_sources_wifi_stopping();
+    esp_err_t result=esp_wifi_start();
+    if (result == ESP_OK) provider_boot_init();
+    provider_sources_wifi_started(result==ESP_OK);
+    return result;
+}
+
+static esp_err_t provider_wifi_stop(void)
+{
+    provider_sources_wifi_stopping();
+    return esp_wifi_stop();
+}
 
 #define NET_CMD_BUFSIZE 512
 
@@ -277,6 +295,9 @@ static void wifi_event_handler(void *esp_netif, esp_event_base_t base, int32_t e
 
     uint8_t evcode = 0;
     switch(event_id) {
+        case WIFI_EVENT_STA_STOP:
+            provider_sources_wifi_stopping();
+            break;
         case WIFI_EVENT_STA_START:
             // Attaching the lwIP netif resets netif->input, so a machine that
             // is off is watched again from here. One that is on is left alone:
@@ -356,7 +377,7 @@ static void wifi_init()
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(provider_wifi_start());
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
@@ -473,8 +494,8 @@ esp_err_t wifi_store_ap(ConnectCommand_t *cmd)
         key[0] = 's';
         key[1] = 'a' + i;
         key[2] = '0'; // SSID sa, sb, sc, sd, ...
-        size_t len = 32;
-        char ssid_buf[32];
+        size_t len = 33;
+        char ssid_buf[33];
         // see if the ssid has been stored already
         err = nvs_get_str(handle, key, ssid_buf, &len);
         if (err != ESP_OK) { // nope, it doesn't exist
@@ -649,10 +670,10 @@ esp_err_t wifi_connect_to_scanned(int index)
     // now look up password
     err = ESP_OK;
     if (ap_info[index].authmode) {
-        err = wifi_find_password(ap_info[index].ssid, last_connect.pw, 64, &last_connect.list_index);
+        err = wifi_find_password(ap_info[index].ssid, last_connect.pw, sizeof(last_connect.pw), &last_connect.list_index);
     } else {
         // no authentication required. But make sure the user has configured this AP.
-        err = wifi_find_password(ap_info[index].ssid, last_connect.pw, 64, &last_connect.list_index);
+        err = wifi_find_password(ap_info[index].ssid, last_connect.pw, sizeof(last_connect.pw), &last_connect.list_index);
         if ((err == ESP_OK) && (last_connect.pw[0] != 0)) {
             // AP is known and configured, however, with a password. Do not allow to connect.
             err = ESP_ERR_NOT_FOUND;
@@ -660,6 +681,7 @@ esp_err_t wifi_connect_to_scanned(int index)
     }
     if (err == ESP_OK) { // known AP found
         strncpy(last_connect.ssid, (const char *)(ap_info[index].ssid), 32);
+        last_connect.ssid[32] = 0;
         last_connect.auth_mode = ap_info[index].authmode;
         return attempt_connect(last_connect.ssid, last_connect.pw, last_connect.auth_mode);
     }
@@ -686,11 +708,11 @@ esp_err_t wifi_connect_to_stored(int index)
     key[1] = 'a' + index;
     key[2] = '0'; // SSID sa, sb, sc, sd, ...
 
-    size_t len = 32;    
+    size_t len = sizeof(last_connect.ssid);
     err = nvs_get_str(handle, key, last_connect.ssid, &len);
     if (err == ESP_OK) {
         key[0] = 'p'; // password pa, pb, pc, pd, ...
-        len = 64;
+        len = sizeof(last_connect.pw);
         err = nvs_get_str(handle, key, last_connect.pw, &len);
         if (err == ESP_OK) {
             key[0] = 'm'; // authmode ma, mb, mc, md, ...
@@ -704,6 +726,17 @@ esp_err_t wifi_connect_to_stored(int index)
     }
     nvs_close(handle);
     return err;
+}
+
+// Not stored and never made the last AP: it is only for the recovery.
+esp_err_t wifi_connect_to_hotspot(void)
+{
+    memset(&last_connect, 0, sizeof(last_connect));
+    strncpy(last_connect.ssid, recovery_hotspot_ssid, sizeof(last_connect.ssid));
+    strncpy(last_connect.pw, recovery_hotspot_password, sizeof(last_connect.pw));
+    last_connect.auth_mode = WIFI_AUTH_WPA2_PSK;
+    last_connect.list_index = -1;
+    return attempt_connect(last_connect.ssid, last_connect.pw, last_connect.auth_mode);
 }
 
 esp_err_t wifi_connect_to_last()
@@ -728,11 +761,22 @@ esp_err_t wifi_connect_to_last()
     return err;
 }
 
+// Walks the ladder now, instead of when the retry timer next runs out.
+void wifi_autoconnect(void)
+{
+    ConnectCommand_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.command = CMD_WIFI_AUTOCONNECT;
+    if (xQueueSend(connect_commands, &cmd, 1000) == pdTRUE) {
+        xSemaphoreGive(connect_semaphore);
+    }
+}
+
 esp_err_t enable_wifi_if_needed(ConnectState_t state)
 {
     if (state == Disabled) {
         ESP_LOGI(TAG, "Starting WiFi.");
-        esp_err_t err = esp_wifi_start();
+        esp_err_t err = provider_wifi_start();
         if (err == ESP_OK) {
             send_event(EVENT_DISCONNECTED);
             disabled_g = 0;
@@ -763,7 +807,7 @@ int handle_connect_command(ConnectCommand_t *cmd, ConnectState_t *state)
                 }
             }
             ESP_LOGI(TAG, "Stopping WiFi.");
-            err = esp_wifi_stop();
+            err = provider_wifi_stop();
             if (err == ESP_OK) {
                 send_event(EVENT_DISABLED);
                 *state = Disabled;
@@ -776,7 +820,7 @@ int handle_connect_command(ConnectCommand_t *cmd, ConnectState_t *state)
         case CMD_WIFI_ENABLE:
             if (*state == Disabled) {
                 ESP_LOGI(TAG, "Starting WiFi.");
-                err = esp_wifi_start();
+                err = provider_wifi_start();
                 if (err == ESP_OK) {
                     send_event(EVENT_DISCONNECTED);
                     *state = LastAP;
@@ -936,6 +980,15 @@ void connect_thread(void *a)
                         }
                     }
                 }
+                if ((state == StoredAPs) && recovery_running()) {
+                    err = wifi_connect_to_hotspot();
+                    if (err == ESP_OK) {
+                        xQueueReceive(connect_events, &connect_event, portMAX_DELAY);
+                        if (connect_event.event_code == EVENT_CONNECTED) {
+                            state = Connected;
+                        }
+                    }
+                }
                 if (state != Connected) {
                     state = Disconnected;
                 }
@@ -1013,6 +1066,7 @@ static void start_connector()
 
 void setup_modem()
 {
+    provider_sources_init();
 	// Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {

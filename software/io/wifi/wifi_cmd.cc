@@ -1,9 +1,12 @@
 #include "wifi_cmd.h"
+#if !defined(RECOVERYAPP) && !defined(WIFI_COMMANDS_ONLY)
+#include "provider_wifi_ingress.h"
+#endif
 #include "dump_hex.h"
 
 /// C like functions to 'talk' with the WiFi Module
-uint16_t sequence_nr = 0;
-TaskHandle_t tasksWaitingForReply[NUM_TX_BUFFERS];
+static uint16_t sequence_nr = 0;
+static wifi_reply_slot_t replySlots[WIFI_REPLY_SLOTS];
 
 void hex(uint8_t h)
 {
@@ -14,12 +17,18 @@ void hex(uint8_t h)
 
 BaseType_t wifi_rx_isr(command_buf_context_t *context, command_buf_t *buf, BaseType_t *w)
 {
+    if (buf->size < int(sizeof(rpc_header_t)) || buf->size > int(sizeof(buf->data))
+#if !defined(RECOVERYAPP) && !defined(WIFI_COMMANDS_ONLY)
+        || wifi_provider_receive(buf)
+#endif
+    ) {
+        return cmd_buffer_free_isr(context, buf, w);
+    }
     rpc_header_t *hdr = (rpc_header_t *)buf->data;
     BaseType_t res;
 
-    if ((hdr->thread < NUM_TX_BUFFERS) && (tasksWaitingForReply[hdr->thread])) {
-        TaskHandle_t thread = tasksWaitingForReply[hdr->thread];
-        tasksWaitingForReply[hdr->thread] = NULL;
+    TaskHandle_t thread = (TaskHandle_t)wifi_reply_take(replySlots, hdr->thread, hdr->sequence);
+    if (thread) {
         ioWrite8(UART_DATA, 'N');
         res = xTaskNotifyFromISR(thread, (uint32_t)buf, eSetValueWithOverwrite, w);
     } else {
@@ -29,8 +38,52 @@ BaseType_t wifi_rx_isr(command_buf_context_t *context, command_buf_t *buf, BaseT
     return res;
 }
 
+int wifi_reply_register(rpc_header_t *hdr)
+{
+    wifi_reply_tag_t tag;
+    ENTER_SAFE_SECTION;
+    int ok = wifi_reply_claim(replySlots, &sequence_nr, xTaskGetCurrentTaskHandle(), &tag);
+    LEAVE_SAFE_SECTION;
+    if (ok) {
+        hdr->thread = tag.thread;
+        hdr->sequence = tag.sequence;
+    }
+    return ok;
+}
+
+// The request buffer is freed by the UART once sent, so the tag is read first.
+command_buf_t *wifi_transmit(command_buf_t *buf, int timeout_ms)
+{
+    rpc_header_t hdr = *(rpc_header_t *)buf->data;
+    esp32.uart->TransmitPacket(buf);
+    return wifi_wait_reply(hdr, timeout_ms);
+}
+
+command_buf_t *wifi_wait_reply(rpc_header_t hdr, int timeout_ms)
+{
+    command_buf_t *reply = NULL;
+    if (xTaskNotifyWait(0, 0, (uint32_t *)&reply, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        return reply;
+    }
+    wifi_reply_tag_t tag = { hdr.thread, hdr.sequence };
+    ENTER_SAFE_SECTION;
+    wifi_reply_abandon(replySlots, &tag);
+    LEAVE_SAFE_SECTION;
+    // The reply may have been delivered just before the slot was released
+    if (xTaskNotifyWait(0, 0, (uint32_t *)&reply, 0) == pdTRUE) {
+        return reply;
+    }
+    return NULL;
+}
+
 void wifi_command_init(void)
 {
+    // A task that was deleted while it waited must not be notified later
+    ENTER_SAFE_SECTION;
+    for (int i = 0; i < WIFI_REPLY_SLOTS; i++) {
+        replySlots[i].task = NULL;
+    }
+    LEAVE_SAFE_SECTION;
 #if (CLOCK_FREQ == 66666667)
     esp32.uart->SetBaudRate(6666666);
 #else
@@ -52,6 +105,7 @@ int wifi_setbaud(int baudrate, uint8_t flowctrl)
     args->flowctrl = flowctrl;
     args->inversions = 0;
 
+    rpc_header_t hdr = args->hdr;
     vTaskDelay(1000);
 
     esp32.uart->TransmitPacket(buf);
@@ -59,25 +113,30 @@ int wifi_setbaud(int baudrate, uint8_t flowctrl)
     esp32.uart->SetBaudRate(baudrate);
     esp32.uart->FlowControl(flowctrl != 0);
 
-    BaseType_t success = xTaskNotifyWait(0, 0, (uint32_t *)&buf, 1000); // 5 seconds
-    if (success == pdTRUE) {
+    buf = wifi_wait_reply(hdr, 5000);
+    if (buf) {
         // copy results
         rpc_espcmd_resp *result = (rpc_espcmd_resp *)buf->data;
+        int retval = result->esp_err;
         esp32.uart->FreeBuffer(buf);
-        tasksWaitingForReply[result->hdr.thread] = NULL;
-        return result->esp_err;
+        return retval;
     }
     return -1;
 }
 
 BaseType_t wifi_detect(uint16_t *major, uint16_t *minor, char *str, int maxlen)
 {
-    BUFARGS(identify, CMD_IDENTIFY);
+    BUFARGS_NOREPLY(identify, CMD_IDENTIFY, pdFALSE); // the result is a success flag here
+    if (!wifi_reply_register(&args->hdr)) {
+        esp32.uart->FreeBuffer(buf);
+        printf(no_wifi_slot);
+        return pdFALSE;
+    }
 
-    esp32.uart->TransmitPacket(buf);
     // now block thread for reply
     printf("Get ident...");
-    BaseType_t success = xTaskNotifyWait(0, 0, (uint32_t *)&buf, 100); // .5 seconds
+    buf = wifi_transmit(buf, 500);
+    BaseType_t success = (buf) ? pdTRUE : pdFALSE;
     if (success == pdTRUE) {
         // From this moment on, "buf" points to the receive buffer!!
         // copy results
@@ -87,10 +146,9 @@ BaseType_t wifi_detect(uint16_t *major, uint16_t *minor, char *str, int maxlen)
         strncpy(str, &result->string, maxlen);
         str[maxlen-1] = 0;
         printf("Identify: %s\n", str);
+        esp32.uart->FreeBuffer(buf);
     } else {
         printf("No reply...\n");
-        // 'buf' still points to the transmit buffer.
-        // It is freed by the TxIRQ, so the content is invalid
         // Let's try to get messages from the receive buffer to see what has been received.
         // printf("Receive queue:\n");
         while (esp32.uart->ReceivePacket(&buf, 0) == pdTRUE) {
@@ -183,6 +241,29 @@ int wifi_get_wake_on_wifi(uint8_t *enabled)
     }
     RETURN_ESP;
 }
+
+int wifi_set_recovery_url(const char *url)
+{
+    BUFARGS(set_recovery_url, CMD_SET_RECOVERY_URL);
+    strncpy(args->url, url, RPC_RECOVERY_URL_LEN - 1);
+    args->url[RPC_RECOVERY_URL_LEN - 1] = 0;
+    TRANSMIT(espcmd);
+    RETURN_ESP;
+}
+
+int wifi_get_recovery_url(char *url, int maxlen)
+{
+    BUFARGS(identify, CMD_GET_RECOVERY_URL);
+    TRANSMIT(get_recovery_url);
+    if (result->esp_err == 0) {
+        strncpy(url, result->url, maxlen - 1);
+        url[maxlen - 1] = 0;
+    } else {
+        url[0] = 0;
+        printf("Get Recovery URL returned %d as error code.\n", result->esp_err);
+    }
+    RETURN_ESP;
+}
 #endif
 
 int wifi_is_connected(uint8_t &status)
@@ -221,7 +302,7 @@ int wifi_scan(void *a)
     ultimate_ap_records_t *aps = (ultimate_ap_records_t *)a;
 
     BUFARGS(identify, CMD_WIFI_SCAN);
-    TRANSMIT(scan);
+    TRANSMIT_T(scan, WIFI_SLOW_TIMEOUT_MS);
     ENTER_SAFE_SECTION;
     memcpy(aps, &(result->rec), sizeof(ultimate_ap_records_t));
     LEAVE_SAFE_SECTION;
@@ -238,14 +319,14 @@ int wifi_wifi_connect(const char *ssid, const char *password, uint8_t auth)
     strncpy(args->password, password, 64);
     args->auth_mode = auth;
 
-    TRANSMIT(scan);
+    TRANSMIT_T(scan, WIFI_SLOW_TIMEOUT_MS);
     RETURN_ESP;
 }
 
 int wifi_wifi_autoconnect()
 {
     BUFARGS(identify, CMD_WIFI_AUTOCONNECT);
-    TRANSMIT(espcmd);
+    TRANSMIT_T(espcmd, WIFI_SLOW_TIMEOUT_MS);
     RETURN_ESP;
 }
 
@@ -318,4 +399,5 @@ int wifi_modem_enable(bool enable)
 }
 
 const char *no_wifi_buf = "*** NO BUFFER TO TRANSMIT ANYTHING.\n";
+const char *no_wifi_slot = "*** NO REPLY SLOT FOR THE WIFI MODULE.\n";
 

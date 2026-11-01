@@ -33,6 +33,8 @@ SRCS_CC	 =  mystring.cc \
 			http_target.cc \
 			pattern.cc \
 			http_request.cc \
+			test_http_transport.cc \
+			test_http_framing.cc \
 			test_http_target.cc
 
 
@@ -43,8 +45,9 @@ SRCS_IEC =
 SRCS_NANO = 
 
 PATH_INC =  $(addprefix -I, $(VPATH))
+VPATH += $(PATH_SW)/network/tests
 OPTIONS  = -g -ffunction-sections -O0 -DRUNS_ON_PC -Wno-format -Wno-format-extra-args -DENABLE_STATIC_FILE=1 -DMHS_PORT=8001 -DTEMP_FILE_PATH=\"./\"
-COPTIONS = $(OPTIONS) -std=c99
+COPTIONS = $(OPTIONS) -std=c99 -D_DEFAULT_SOURCE
 CPPOPT   = $(OPTIONS) -fno-exceptions -fno-rtti -fno-threadsafe-statics
 LINK 	 = ./mb_app.lds
 LIBS     =  -lgcc 
@@ -71,3 +74,18 @@ test-body-removal:
 	    CPP="$(CPP) -fsanitize=address,undefined -fno-sanitize-recover=all" all
 	# ASan must precede any libraries preloaded by the build environment.
 	@LD_PRELOAD="$$($(CPP) -print-file-name=libasan.so)$${LD_PRELOAD:+:$$LD_PRELOAD}" result/body-removal/$(PRJ) --body-removal
+
+# Exercise real refused connections on loopback without an external service.
+.PHONY: test-connect-cleanup
+test-connect-cleanup:
+	@$(MAKE) OUTPUT=output/connect-cleanup RESULT=result/connect-cleanup \
+	    CC="$(CC) -fsanitize=address,undefined -fno-sanitize-recover=all" \
+	    CPP="$(CPP) -fsanitize=address,undefined -fno-sanitize-recover=all" all
+	@timeout 30s env LD_PRELOAD="$$($(CPP) -print-file-name=libasan.so)$${LD_PRELOAD:+:$$LD_PRELOAD}" result/connect-cleanup/$(PRJ) --connect-cleanup
+
+.PHONY: test-response-completion test-response-boundaries test-response-cleanup test-transport
+test-response-completion test-response-boundaries test-response-cleanup test-transport:
+	@$(MAKE) OUTPUT=output/response-completion RESULT=result/response-completion \
+	    CC="$(CC) -fsanitize=address,undefined -fno-sanitize-recover=all" \
+	    CPP="$(CPP) -fsanitize=address,undefined -fno-sanitize-recover=all" all
+	@timeout 30s env LD_PRELOAD="$$($(CPP) -print-file-name=libasan.so)$${LD_PRELOAD:+:$$LD_PRELOAD}" result/response-completion/$(PRJ) --$(patsubst test-%,%,$@)

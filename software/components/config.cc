@@ -26,6 +26,9 @@ extern "C" {
 #include <string.h>
 #include "blockdev_flash.h"
 #include "filemanager.h"
+#ifdef ULTIMATE_PROVIDER_JOURNAL
+#include "provider_native_startup.h"
+#endif
 
 #if U64
 #include "u64.h"
@@ -41,6 +44,9 @@ ConfigManager :: ConfigManager() : stores(16, NULL), pages(16, NULL)
 	} else {
     	num_pages = flash->get_number_of_config_pages();
     	printf("ConfigManager opened flash: %p\n", flash);
+#ifdef ULTIMATE_PROVIDER_JOURNAL
+        provider_journal_prepare(*flash);
+#endif
     }
 	safeMode = false;
 
@@ -155,6 +161,9 @@ ConfigStore *ConfigManager :: register_store(uint32_t page_id, const char *name,
     if (!page) {
         uint32_t id;
         for(int i=0;i<num_pages;i++) {
+#ifdef ULTIMATE_PROVIDER_JOURNAL
+            if (provider_journal_reserved_slot(*flash,i)) continue;
+#endif
             flash->read_config_page(i, 4, &id);
             if (id == 0xFFFFFFFF) {
                 //printf("Found empty spot on config page %d, for ID=%8x. Size=%d. Defs=%p. Name=%s\n", i, store_id, page_size, defs, name);
@@ -601,6 +610,7 @@ void ConfigStore :: check_bounds(void)
 ConfigItem :: ConfigItem(ConfigStore *s, t_cfg_definition *d)
 {
 	hook = NULL;
+	order = NULL;
 	definition = d;
     store = s;
     if ((d->type == CFG_TYPE_STRING)||(d->type == CFG_TYPE_INFO)||(d->type == CFG_TYPE_STRFUNC)||(d->type == CFG_TYPE_STRPASS)) {
@@ -762,10 +772,18 @@ int ConfigItem :: pack(uint8_t *buffer, int len)
 const char *ConfigItem :: get_display_string(char *buffer, int width, int act, int inact)
 {
 	static char buf[32];
+    const char *src = altname.length() ? altname.c_str() : definition->item_text;
+    int room = width - (int)strlen(src) - 1;
+    if (room > (int)sizeof(buf) - 1) {
+        room = sizeof(buf) - 1;
+    } else if (room < 0) {
+        room = 0;
+    }
+    int keep;
 
     memset(buffer, ' ', width+2);
     buffer[width+2] = '\0';
-    
+
     switch(definition->type) {
         case CFG_TYPE_VALUE:
             sprintf(buf, definition->item_format, value);
@@ -776,7 +794,14 @@ const char *ConfigItem :: get_display_string(char *buffer, int width, int act, i
         case CFG_TYPE_STRING:
         case CFG_TYPE_STRFUNC:
         case CFG_TYPE_INFO:
-            sprintf(buf, definition->item_format, string);
+            if ((int)strlen(string) <= room) {
+                sprintf(buf, definition->item_format, string);
+                break;
+            }
+            // Cut a string that does not fit beside the name, and say so.
+            keep = (room > 3) ? room - 3 : 0;
+            strncpy(buf, string, keep);
+            strcpy(buf + keep, "...");
             break;
         case CFG_TYPE_STRPASS:
             if (*string)
@@ -794,10 +819,8 @@ const char *ConfigItem :: get_display_string(char *buffer, int width, int act, i
 
     int len = strlen(buf);
 
-    const char *src;
     char *dst;
     // left align copy
-    src = altname.length() ? altname.c_str() : definition->item_text;
     dst = buffer;
     while(*src) {
         *(dst++) = *(src++);
@@ -825,9 +848,10 @@ int   ConfigItem :: fetch_possible_settings(IndexedList<ConfigSetting *> &list)
             ret = definition->max - definition->min + 1;
             break;
         case CFG_TYPE_ENUM:
-            for(i=definition->min;i<=definition->max;i++) {
-                sprintf(buf, definition->item_format, definition->items[i]);
-                list.append(new ConfigSetting(i, this, buf));
+            for(i=0;i<=definition->max-definition->min;i++) {
+                int v = listedValue(i);
+                sprintf(buf, definition->item_format, definition->items[v]);
+                list.append(new ConfigSetting(v, this, buf));
             }
             ret = definition->max - definition->min + 1;
             break;
@@ -862,6 +886,10 @@ int ConfigItem :: next(int a)
 {
     int value = getValue();
     int ret = 0;
+    if (order && definition->type == CFG_TYPE_ENUM) {
+        int n = 1 + definition->max - definition->min;
+        return setValue(order[((listPosition(value) + a) % n + n) % n]);
+    }
     switch(definition->type) {
         case CFG_TYPE_ENUM:
         case CFG_TYPE_VALUE:
@@ -883,6 +911,10 @@ int ConfigItem :: previous(int a)
 {
     int value = getValue();
     int ret = 0;
+    if (order && definition->type == CFG_TYPE_ENUM) {
+        int n = 1 + definition->max - definition->min;
+        return setValue(order[((listPosition(value) - a) % n + n) % n]);
+    }
     switch(definition->type) {
         case CFG_TYPE_ENUM:
         case CFG_TYPE_VALUE:
@@ -897,6 +929,19 @@ int ConfigItem :: previous(int a)
             break;
     }
     return ret;
+}
+
+int ConfigItem :: listPosition(int v)
+{
+    if (!order) {
+        return v - definition->min;
+    }
+    for (int pos = 0; pos <= definition->max - definition->min; pos++) {
+        if (order[pos] == v) {
+            return pos;
+        }
+    }
+    return 0;
 }
 
 int ConfigItem :: setChanged()

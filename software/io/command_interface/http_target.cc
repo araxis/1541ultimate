@@ -3,7 +3,12 @@
 #include <stdio.h>
 
 // Register the target as ID $06 [cite: 117]
+#ifdef ULTIMATE_PROVIDER_JOURNAL
+#include "provider_native_startup.h"
+HttpTarget http_target(6, provider_https_factory());
+#else
 HttpTarget http_target(6);
+#endif
 
 static Message c_http_identification  = { 25, true, (uint8_t *)"ULTIMATE HTTP TARGET V1.0" };
 static Message c_status_http_ok       = {  6, true, (uint8_t *)"000 OK" };
@@ -19,7 +24,7 @@ static Message c_status_no_more       = { 16, true, (uint8_t *)"500 NO MORE DATA
 static Message c_status_not_available = { 23, true, (uint8_t *)"503 SERVICE UNAVAILABLE" };
 static Message c_status_no_valid_json = { 17, true, (uint8_t *)"400 NO VALID JSON"};
 
-HttpTarget::HttpTarget(int id)
+HttpTarget::HttpTarget(int id, HttpSecureProvider *provider)
 {
     command_targets[id] = this;
     memset(headers, 0, sizeof(headers));
@@ -27,32 +32,52 @@ HttpTarget::HttpTarget(int id)
     data_message.message = new uint8_t[CMD_MAX_REPLY_LEN];
     status_message.message = new uint8_t[CMD_MAX_STATUS_LEN];
     exch = NULL;
+    secure_provider = provider;
+    secure_connection = NULL;
     response_data = NULL;
+    secure_reply = rejected_reply = false;
+    pending_header = pending_body = -1;
 }
 
 HttpTarget::~HttpTarget()
 {
+    release_all();
+    delete[] data_message.message;
+    delete[] status_message.message;
+}
+
+void HttpTarget::release_all()
+{
+    reset_responses();
     for(int i=0; i<MAX_HTTP_HANDLES; i++) {
         if (headers[i]) {
             delete headers[i];
+            headers[i] = NULL;
         }
     }
     for(int i=0; i<MAX_HTTP_HANDLES; i++) {
         if (bodies[i]) {
             delete bodies[i];
+            bodies[i] = NULL;
         }
     }
-    delete[] data_message.message;
-    delete[] status_message.message;
-    reset_responses();
 }
 
-void HttpTarget::reset_responses()
+void HttpTarget::release_exchange()
 {
     if (exch) {
         delete exch;
         exch = NULL;
     }
+    // HttpRequest borrows this connection; destroy it only after the request.
+    delete secure_connection;
+    secure_connection = NULL;
+}
+
+void HttpTarget::reset_responses()
+{
+    secure_reply = rejected_reply = false;
+    release_exchange();
     if (response_data) {
         delete response_data;
         response_data = NULL;
@@ -303,6 +328,8 @@ bool HttpBodySlot::add_encoded(const uint8_t *data, int length, char *error)
 
 void HttpTarget::parse_command(Message *command, Message **reply, Message **status)
 {
+    secure_reply = rejected_reply = false;
+    pending_header = pending_body = -1;
     *reply = &c_message_empty;
     *status = &c_status_bad_cmd;
 
@@ -313,10 +340,7 @@ void HttpTarget::parse_command(Message *command, Message **reply, Message **stat
             break;
 
         case HTTP_CMD_FREE_ALL:
-            for(int i=0; i<MAX_HTTP_HANDLES; i++) {
-                if (headers[i]) { delete headers[i]; headers[i] = NULL; }
-                if (bodies[i])  { delete bodies[i];  bodies[i]  = NULL; }
-            }
+            release_all();
             *status = &c_status_http_ok;
             break;
 
@@ -506,8 +530,8 @@ void HttpTarget::cmd_header_query(Message *command, Message **reply, Message **s
         rend = j->render();
     }
     int len_out = strlen(rend);
-    if (len_out > CMD_MAX_REPLY_LEN)
-        len_out = CMD_MAX_REPLY_LEN;
+    if (len_out > HTTP_MAX_REPLY_BYTES)
+        len_out = HTTP_MAX_REPLY_BYTES;
     data_message.length = len_out;
     data_message.last_part = true;
     memcpy(data_message.message, rend, len_out);
@@ -564,7 +588,7 @@ void HttpTarget::cmd_header_list(Message *command, Message **reply, Message **st
     }
 
     *reply = &data_message;
-    data_message.length = s.read((char *)data_message.message, 895);
+    data_message.length = s.read((char *)data_message.message, HTTP_MAX_REPLY_BYTES);
     data_message.last_part = true;
 
     *status = &c_status_http_ok;
@@ -878,57 +902,81 @@ void HttpTarget::cmd_exchange(Message *command, Message **reply, Message **statu
 
     reset_responses();
 
-    exch = new HttpRequest();
+    if (!hdr->is_valid()) {
+        *status = &c_status_bad_format;
+        return;
+    }
+    if (hdr->is_secure()) {
+        if (cancellation.cancelled() || !secure_provider || !secure_provider->available()) {
+            *status = &c_status_not_available;
+            return;
+        }
+        exchange_cancellation = cancellation;
+        provider_cancellation = secure_provider->lifetime();
+        secure_connection = secure_provider->create_connection(exchange_cancellation);
+        if (!secure_connection || provider_cancellation.cancelled() || !secure_provider->available()) {
+            release_exchange();
+            *status = &c_status_not_available;
+            return;
+        }
+    }
+    exch = new HttpRequest(secure_connection);
     if (exch->connect_to_server(hdr->get_host(), hdr->get_port()) >= 0) {
         if (!exch->send_request(&req)) {
             if (raw) {
                 HTTPReqHeader *hdr = exch->get_header();
                 if (hdr) {
                     hdr->RawCopy = status_message.message;
-                    hdr->RawCopySize = CMD_MAX_STATUS_LEN;
+                    hdr->RawCopySize = HTTP_MAX_STATUS_BYTES;
                 }
             }
-            exch->recv_response();
+            if (!exch->recv_response()) {
+                release_exchange();
+                *status = &c_status_not_available;
+                return;
+            }
         } else {
             printf("Failed to send request\n");
-            delete exch;
-            exch = NULL;
+            release_exchange();
             *status = &c_status_not_available;
             return;
         }
     } else {
         printf("Failed to connect.\n");
-        delete exch;
-        exch = NULL;
+        release_exchange();
         *status = &c_status_not_available;
         return;
     }
 
     // When we are here, the exch object exists and should contain the reply.
+    if (hdr->is_secure() && (exchange_cancellation.cancelled() || provider_cancellation.cancelled() || !secure_provider->available())) {
+        release_exchange();
+        *status = &c_status_not_available;
+        return;
+    }
 
     int slot = -1;
+    secure_reply = hdr->is_secure();
     if(raw) {
         // Return raw data in data channel [cite: 264]
         *reply = &data_message;
-        data_message.length = exch->read_response_data(CMD_MAX_REPLY_LEN, data_message.message);
-        data_message.last_part = (data_message.length != CMD_MAX_REPLY_LEN);
-        // Copy at most CMD_MAX_STATUS_LEN bytes into the status. Note that parse header will insert
+        data_message.length = exch->read_response_data(HTTP_MAX_REPLY_BYTES, data_message.message);
+        data_message.last_part = (data_message.length != HTTP_MAX_REPLY_BYTES);
+        // Copy at most HTTP_MAX_STATUS_BYTES bytes into the status. Note that parse header will insert
         // zeros at string boundaries
         HTTPReqHeader *hdr = exch->get_header();
         *status = &status_message;
         status_message.length = hdr->RawCopyLength;
         // Clean up if this was the last message
         if (data_message.last_part) {
-            delete exch;
-            exch = NULL;
+            release_exchange();
         }
     } else {
         JSON *json = exch->get_json();
         if(!json) {
             *reply = &c_message_empty;
             *status = &c_status_no_valid_json;
-            delete exch;
-            exch = NULL;
+            release_exchange();
             return;
         }
         for(int i=0; i<MAX_HTTP_HANDLES; i++) {
@@ -941,8 +989,7 @@ void HttpTarget::cmd_exchange(Message *command, Message **reply, Message **statu
             *status = &c_status_no_data_slot;
             *reply = &c_message_empty;
             delete json;
-            delete exch;
-            exch = NULL;
+            release_exchange();
             return;
         }
         body_handle = slot;
@@ -961,14 +1008,17 @@ void HttpTarget::cmd_exchange(Message *command, Message **reply, Message **statu
 
             delete bodies[body_handle]; // also deletes the json
             bodies[body_handle] = NULL;
-            delete exch;
-            exch = NULL;
+            release_exchange();
             return;
         }
 
         hdr_handle = slot;
         headers[hdr_handle] = new HttpHeaderSlot(hdr);
         headers[hdr_handle]->convert_from_response(exch->get_header());
+        if (secure_reply) {
+            pending_header = hdr_handle;
+            pending_body = body_handle;
+        }
 
         // Create response objects and return two handles [cite: 258]
         data_message.message[0] = hdr_handle; // New Header Handle
@@ -987,17 +1037,23 @@ void HttpTarget::cmd_exchange(Message *command, Message **reply, Message **statu
         }
 
         // we should have taken all the data from the exchange
-        delete exch;
-        exch = NULL;
+        release_exchange();
     }
 }
 
 void HttpTarget::get_more_data(Message **reply, Message **status)
 {
+    secure_reply = secure_connection != NULL;
+    if (secure_connection && (exchange_cancellation.cancelled() || provider_cancellation.cancelled() || !secure_provider->available())) {
+        reset_responses();
+        *reply = &c_message_empty;
+        *status = &c_status_not_available;
+        return;
+    }
     if (response_data) {
         *reply = &data_message;
-        data_message.length = response_data->read((char *)data_message.message, CMD_MAX_REPLY_LEN);
-        data_message.last_part = (data_message.length != CMD_MAX_REPLY_LEN);
+        data_message.length = response_data->read((char *)data_message.message, HTTP_MAX_REPLY_BYTES);
+        data_message.last_part = (data_message.length != HTTP_MAX_REPLY_BYTES);
         *status = &c_status_http_ok; 
         if (data_message.last_part) {
             delete response_data;
@@ -1005,11 +1061,10 @@ void HttpTarget::get_more_data(Message **reply, Message **status)
         }
     } else if (exch) {
         *reply = &data_message;
-        data_message.length = exch->read_response_data(CMD_MAX_REPLY_LEN, data_message.message);
-        data_message.last_part = (data_message.length != CMD_MAX_REPLY_LEN);
+        data_message.length = exch->read_response_data(HTTP_MAX_REPLY_BYTES, data_message.message);
+        data_message.last_part = (data_message.length != HTTP_MAX_REPLY_BYTES);
         if (data_message.last_part) {
-            delete exch;
-            exch = NULL;
+            release_exchange();
         }
         *status = &c_status_http_ok;
     } else {
@@ -1018,10 +1073,36 @@ void HttpTarget::get_more_data(Message **reply, Message **status)
     }
 }
 
+void HttpTarget::prepare_reply(Message **reply, Message **status)
+{
+    if (secure_reply && (exchange_cancellation.cancelled() || provider_cancellation.cancelled() || !secure_provider->available())) {
+        rejected_reply = true;
+        *reply = &c_message_empty;
+        *status = &c_status_not_available;
+    }
+}
+
+void HttpTarget::finish_reply(bool published)
+{
+    if (secure_reply && (!published || rejected_reply)) {
+        if (pending_header >= 0) { delete headers[pending_header]; headers[pending_header] = NULL; }
+        if (pending_body >= 0) { delete bodies[pending_body]; bodies[pending_body] = NULL; }
+        reset_responses();
+    }
+    pending_header = pending_body = -1;
+    rejected_reply = false;
+    if (!exch) secure_reply = false;
+}
+
 void HttpTarget::abort(int a)
 {
     // Reset any pending exchange state
     reset_responses();
+}
+
+void HttpTarget::c64_reset(void)
+{
+    release_all();
 }
 
 int HttpTarget::create_body_from_json(char *body, int size, uint8_t *handle)

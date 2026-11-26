@@ -44,6 +44,7 @@
 #define CFG_USERIF_COLORSCHEME 0x0E
 #define CFG_USERIF_TEMP_AUTO_CLEANUP 0x0F
 #define CFG_USERIF_TEMP_USE_CACHE_SUBFOLDER 0x10
+#define CFG_USERIF_CBM_NAMES   0x11
 
 typedef enum {
     e_keymap_default,
@@ -65,6 +66,13 @@ private:
 
     bool initialized;
     bool doBreak;
+    // The task that is inside run_once() (NULL otherwise), and a teardown that
+    // another task asked for. The menu is torn down only by that task, never
+    // while it is drawing: see release_host().
+    void *volatile ownerTask;
+    // 0 none, 1 requested by another task, 2 being served; changed only inside a
+    // critical section, so a withdrawn request cannot overlap a serve.
+    volatile int releaseState;
     bool available;
     // A menu on a network stream (Telnet). It has its own keyboard, so it does
     // not count as a menu the USB keyboard and mouse, or REST, are driving.
@@ -75,17 +83,19 @@ private:
     
     void set_screen_title(void);
     void set_available(bool enable);
+    void service_release_request(void);
     int  pollFocussed(void);
     bool pollMenuButtonPush(void);
     void discardPendingMenuButton(void);
     void peel_off(void);
     bool buttonDownFor(uint32_t ms);
-    void run_editor(Editor *);
+    void run_editor(Editor *, bool abortable = false);
 public:
     int color_border, color_bg, color_fg, color_sel, color_sel_bg, reverse_sel;
     int color_status, color_inactive, color_configitem;
 
     int config_save, filename_overflow_squeeze, navmode;
+    bool cbm_names; // PETSCII filename presentation in the lower/upper case set
     bool logo;
     GenericHost *host;
     Keyboard *keyboard;
@@ -97,7 +107,7 @@ public:
     virtual ~UserInterface();
 
     // from HostClient
-    virtual void release_host();
+    virtual bool release_host();
 
     virtual bool is_available(void);
     virtual void run();

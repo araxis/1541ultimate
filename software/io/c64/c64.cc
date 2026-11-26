@@ -30,6 +30,7 @@
 #include "integer.h"
 #include "dump_hex.h"
 #include "c64.h"
+#include "raster_wait.h"
 #include "u64.h"
 #include "c64_crt.h"
 #include "flash.h"
@@ -127,6 +128,7 @@ static unsigned char fastresetOrg[] =   { 0xe6, 0xc2, 0xb1, 0xc1, 0xaa, 0xa9, 0x
 
 C64::C64()
 {
+    ownershipLock = xSemaphoreCreateRecursiveMutex();
     flash = get_flash();
 
     register_store(0x43363420, "C64 and Cartridge Settings", c64_config);
@@ -147,6 +149,8 @@ C64::C64()
     C64_STOP_MODE = STOP_COND_FORCE;
     C64_MODE = MODE_NORMAL;
     isFrozen = false;
+    keyboardScanAllowed = false;
+    dmaModeWindow = 0;
     frozen_mode = MODE_NORMAL;
     backupIsValid = false;
     frozen_cia2_porta_changed = false;
@@ -238,6 +242,7 @@ void C64 :: init_poll_task(void *a)
 C64::~C64()
 {
     if (isFrozen) {
+        keyboardScanAllowed = false;
         restore_io();
         resume();
         isFrozen = false;
@@ -374,18 +379,27 @@ void C64::determine_d012(void)
     vic_d012 = 0;
     vic_d011 = 0;
 
+    // A compare on a line that exists matches within one frame (20 ms PAL, 17 ms NTSC),
+    // so 22 ms (one partial and 21 whole 1 ms ticks) is enough; menu entry waits for it.
     b = 0;
     while (!(VIC_REG(25) & 0x81)) {
         if (!ioRead8(ITU_TIMER)) {
             ioWrite8(ITU_TIMER, 200);
             b++;
-            if (b == 40)
+            if (b == 22)
                 break;
         }
     }
 
-    vic_d012 = VIC_REG(18); // d012
-    vic_d011 = VIC_REG(17); // d011
+    if (b < 22) {
+        vic_d012 = VIC_REG(18); // d012
+        vic_d011 = VIC_REG(17); // d011
+    } else {
+        // No match in a whole frame: the compare is past the last line, so it never fires.
+        // Keep it that way rather than putting back whatever line the raster is on.
+        vic_d012 = 0xFF;
+        vic_d011 = VIC_REG(17) | 0x80;
+    }
 
     VIC_REG(26) = 0x00; // disable interrutps
     VIC_REG(25) = 0x81; // clear raster interrupt
@@ -406,6 +420,22 @@ void C64 :: hard_stop(void)
             ;
     }
     wait_10us(2);
+}
+
+// The VIC registers and the 1 ms timer as raster_wait.h reads and writes them
+namespace {
+struct VicRasterBus {
+    uint8_t read(int reg) { return VIC_REG(reg); }
+    void write(int reg, uint8_t v) { VIC_REG(reg) = v; }
+    bool ms_elapsed()
+    {
+        if (ioRead8(ITU_TIMER)) {
+            return false;
+        }
+        ioWrite8(ITU_TIMER, 200); // 1 ms
+        return true;
+    }
+};
 }
 
 void C64::stop(bool do_raster)
@@ -440,11 +470,12 @@ void C64::stop(bool do_raster)
                 // enter ultimax mode, so we can be sure that we can access IO space!
                 goUltimax();
 
-                printf("Ultimax set.. Now reading registers..\n");
-                raster = VIC_REG(18);
-                raster_hi = VIC_REG(17);
+                // the line first: the raster moves on while printf waits for the UART
+                VicRasterBus bus;
+                raster_read(bus, raster, raster_hi);
                 vic_irq_en = VIC_REG(26);
                 vic_irq = VIC_REG(25);
+                printf("Ultimax set.. Registers read.\n");
                 stop_mode = 1;
                 printf("Mode=1\n");
                 break;
@@ -502,12 +533,11 @@ void C64::stop(bool do_raster)
         switch (stop_mode) {
         case 1:
             printf("Frozen on Bad line. Raster = %02x. VIC Irq Enable: %02x. Vic IRQ: %02x\n", raster, vic_irq_en, vic_irq);
-            if (vic_irq_en & 0x01) { // Raster interrupt enabled
-                determine_d012();
-                printf("Original d012/11 content = %02x %02x.\n", vic_d012, vic_d011);
-            } else {
-                vic_d011 = VIC_REG(17); // for all other bits
-            }
+            // resume() writes the compare back whether or not the raster interrupt is enabled
+            // ($D019 latches the match either way), so find it either way. $D011 reads the
+            // raster, not the compare, in bit 7.
+            determine_d012();
+            printf("Original d012/11 content = %02x %02x.\n", vic_d012, vic_d011);
             break;
         case 2:
             printf("Frozen on R/Wn sequence.\n");
@@ -523,52 +553,25 @@ void C64::stop(bool do_raster)
 
 void C64::resume(void)
 {
-    int dummy = 0;
-    uint8_t rast_lo;
-    uint8_t rast_hi;
-
-    if (!raster && !raster_hi) {
-        rast_lo = 0;
-        rast_hi = 0;
-    } else {
-        rast_lo = raster - 1;
-        rast_hi = raster_hi & 0x80;
-        if (!raster)
-            rast_hi = 0;
-    }
+    int dummy;
+    VicRasterBus bus;
 
     // either resume in mode 0 or in mode 3  (never on R/Wn sequence of course!)
     if (stop_mode == 1) {
         // this can only occur when we exit from the menu, so we are still
         // in ultimax mode, so we can see the VIC here.
-        if (vic_irq & 0x01) { // was raster flag set when we stopped? then let's set it again
-            VIC_REG(26) = 0x81;
-            VIC_REG(18) = rast_lo;
-            VIC_REG(17) = rast_hi;
-            while ((VIC_REG(18) != rast_lo) && ((VIC_REG(17) & 0x80) != rast_hi)) {
-                if (!ioRead8(ITU_TIMER)) {
-                    ioWrite8(ITU_TIMER, 200); // 1 ms
-                    dummy++;
-                    if (dummy == 40)
-                        break;
-                }
-            }
-            VIC_REG(18) = vic_d012;
-            VIC_REG(17) = vic_d011;
-        } else {
-            while ((VIC_REG(18) != rast_lo) && ((VIC_REG(17) & 0x80) != rast_hi)) {
-                if (!ioRead8(ITU_TIMER)) {
-                    ioWrite8(ITU_TIMER, 200); // 1 ms
-                    dummy++;
-                    if (dummy == 40)
-                        break;
-                }
-            }
-            VIC_REG(18) = vic_d012;
-            VIC_REG(17) = vic_d011;
-            VIC_REG(25) = 0x81; // clear raster irq
-        }
-        VIC_REG(26) = vic_irq_en;
+        RasterResume state;
+        state.raster = raster;
+        state.raster_hi = raster_hi;
+        state.vic_irq = vic_irq;
+        state.vic_irq_en = vic_irq_en;
+        state.vic_d011 = vic_d011;
+        state.vic_d012 = vic_d012;
+#if U64
+        raster_resume(bus, state, true);  // stop and release are immediate (g_direct_dma)
+#else
+        raster_resume(bus, state, false); // released on the next bad line
+#endif
 
         raster = VIC_REG(18);
         vic_irq_en = VIC_REG(26);
@@ -655,6 +658,7 @@ uint8_t C64::peek(uint16_t address)
         if (isFrozen && address >= 0x1000 && (address < 0xD000 || address >= 0xE000)) {
             saved_mode = C64_MODE;
             if ((saved_mode & C64_MODE_ULTIMAX) && (saved_mode != frozen_mode)) {
+                dmaModeWindow++;
                 C64_MODE = frozen_mode;
                 restore_mode = true;
                 // The mode write has to reach the machine before the read it
@@ -669,6 +673,8 @@ uint8_t C64::peek(uint16_t address)
         value = ram[address];
         if (restore_mode) {
             C64_MODE = saved_mode;
+            wait_10us(2);
+            dmaModeWindow--;
         }
     }
 
@@ -701,6 +707,7 @@ void C64::poke(uint16_t address, uint8_t value)
         if (isFrozen && address >= 0x1000 && (address < 0xD000 || address >= 0xE000)) {
             saved_mode = C64_MODE;
             if ((saved_mode & C64_MODE_ULTIMAX) && (saved_mode != frozen_mode)) {
+                dmaModeWindow++;
                 C64_MODE = frozen_mode;
                 restore_mode = true;
                 (void)ram[address];
@@ -714,6 +721,8 @@ void C64::poke(uint16_t address, uint8_t value)
             // read holds the mode until the write has been taken.
             (void)ram[address];
             C64_MODE = saved_mode;
+            wait_10us(2);
+            dmaModeWindow--;
         }
     }
 
@@ -722,11 +731,38 @@ void C64::poke(uint16_t address, uint8_t value)
     }
 }
 
+// A cartridge reaches C64 memory through the 6510's own $01 mapping, so this is
+// the CPU view, read as machine:readmem reads it. The I/O registers are left at
+// $FF rather than read: a read acknowledges CIA flags and switches some carts.
+void C64::get_all_memory(uint8_t *pb)
+{
+    static const uint16_t spans[][2] = { { 0x0000, 0xD000 }, { 0xD800, 0x0400 }, { 0xE000, 0x2000 } };
+    bool stopped_it = !is_stopped();
+    if (stopped_it) {
+        stop(false);
+    }
+    memset(pb + 0xD000, 0xFF, 0x1000);
+    for (int i = 0; i < 3; i++) {
+        uint16_t start = spans[i][0];
+        if (isFrozen) {
+            dma_transfer_frozen(start, pb + start, spans[i][1], 1);
+        } else {
+            memcpy(pb + start, (const void *)(C64_MEMORY_BASE + start), spans[i][1]);
+        }
+    }
+    if (stopped_it) {
+        resume();
+    }
+}
+
 void C64::dma_transfer_frozen(uint16_t offset, uint8_t *buffer, int length, int rw)
 {
     volatile uint8_t *ram = (volatile uint8_t *)C64_MEMORY_BASE;
+#if U64
+    // A U64 register; on a cartridge this address belongs to other hardware.
     uint8_t saved_memonly = C64_DMA_MEMONLY;
     C64_DMA_MEMONLY = 1;
+#endif
 
     int pos = 0;
     while (pos < length) {
@@ -748,9 +784,12 @@ void C64::dma_transfer_frozen(uint16_t offset, uint8_t *buffer, int length, int 
             uint8_t saved_mode = C64_MODE;
             bool restore_mode = (saved_mode & C64_MODE_ULTIMAX) && (saved_mode != frozen_mode);
             if (restore_mode) {
+                dmaModeWindow++;
                 C64_MODE = frozen_mode;
             }
+#if U64
             C64_DMA_MEMONLY = 0;
+#endif
             // Both registers above re-decode the C64 bus, and that has to
             // reach the machine before the transfer is issued. Reading the
             // registers back does not achieve it: they are on this side and
@@ -774,18 +813,26 @@ void C64::dma_transfer_frozen(uint16_t offset, uint8_t *buffer, int length, int 
                 // length landed its first two bytes and nothing after them.
                 (void)ram[addr];
             }
+#if U64
             C64_DMA_MEMONLY = 1;
+#endif
             if (restore_mode) {
                 C64_MODE = saved_mode;
+                // The mode change reaches the C64's decoding with a delay, so
+                // the window closes only after it.
+                wait_10us(2);
+                dmaModeWindow--;
             }
-        } else if ((addr >= 0x0800) && (addr < 0x1000)) {
-            // The freezer menu uses this 2KB as its own scratch RAM, so serve
-            // reads/writes from the backup taken at freeze time instead: it is
+        } else if ((addr >= 0x0400) && (addr < 0x1000)) {
+            // The freezer menu uses $0400-$0FFF for its own screen and charset, so serve
+            // reads/writes from the backups taken at freeze time instead: they are
             // restored to real RAM on unfreeze, unlike the live (bypassed) range.
-            if ((0x1000 - addr) < chunk) {
-                chunk = 0x1000 - addr;
+            int region_end = (addr < 0x0800) ? 0x0800 : 0x1000;
+            if ((region_end - addr) < chunk) {
+                chunk = region_end - addr;
             }
-            uint8_t *backup = ((uint8_t *)ram_backup) + (addr - 0x0800);
+            uint8_t *backup = (addr < 0x0800) ? ((uint8_t *)screen_backup) + (addr - 0x0400)
+                                              : ((uint8_t *)ram_backup) + (addr - 0x0800);
             if (rw) {
                 memcpy(buffer + pos, backup, chunk);
             } else {
@@ -804,8 +851,8 @@ void C64::dma_transfer_frozen(uint16_t offset, uint8_t *buffer, int length, int 
             }
         } else {
             int next_boundary;
-            if (addr < 0x0800) {
-                next_boundary = 0x0800;
+            if (addr < 0x0400) {
+                next_boundary = 0x0400;
             } else if (addr < 0x8000) {
                 next_boundary = 0x8000;
             } else if (addr < 0xD800) {
@@ -825,7 +872,9 @@ void C64::dma_transfer_frozen(uint16_t offset, uint8_t *buffer, int length, int 
         pos += chunk;
     }
 
+#if U64
     C64_DMA_MEMONLY = saved_memonly;
+#endif
 }
 
 #if U64
@@ -984,6 +1033,13 @@ void C64::init_io(void)
 
 void C64::freeze(void)
 {
+    lock_ownership();
+    freeze_locked();
+    unlock_ownership();
+}
+
+void C64::freeze_locked(void)
+{
     if (!phi2_present())
         return;
 
@@ -1005,6 +1061,7 @@ void C64::freeze(void)
     init_io();
 
     isFrozen = true;
+    keyboardScanAllowed = true;
 }
 
 /*
@@ -1124,8 +1181,19 @@ void C64::init_system_roms(void)
  */
 void C64::unfreeze()
 {
+    lock_ownership();
+    unfreeze_locked();
+    unlock_ownership();
+}
+
+void C64::unfreeze_locked()
+{
     if (!isFrozen)
         return;
+
+    // restore_io() hands the CIA back to the program, and a scan before resume() would leave
+    // the keyboard column select as the scan set it.
+    keyboardScanAllowed = false;
 
     if (!backupIsValid) {
         // Nothing left to put back: something else already restored it
@@ -1220,6 +1288,7 @@ void C64 :: start_cartridge(void *vdef)
     C64_MODE = C64_MODE_UNRESET;
 
     isFrozen = false;
+    keyboardScanAllowed = false;
     backupIsValid = false;
 }
 
@@ -1232,6 +1301,18 @@ Screen *C64::getScreen(void)
 bool C64::is_accessible(void)
 {
     return isFrozen;
+}
+
+bool C64::keyboard_scan_allowed(void)
+{
+    // The same window the user interface's own scan had, freeze() to
+    // unfreeze(), minus the restore at its end.
+    return keyboardScanAllowed && isFrozen;
+}
+
+bool C64::keyboard_scan_deferred(void)
+{
+    return dmaModeWindow != 0;
 }
 
 Keyboard *C64::getKeyboard(void)
@@ -1350,7 +1431,10 @@ void C64::set_cartridge(cart_def *cart)
         }
         C64_REU_ENABLE = 0;
     }
-    if(def->prohibit & (CART_UCI | CART_UCI_DFFC | CART_UCI_DE1C)) {
+    // A cartridge that requires the UCI has it at the address selected above; its prohibition
+    // only rules out the other addresses (EasyFlash: required at $DE1C, prohibited at $DF1C).
+    if((def->prohibit & (CART_UCI | CART_UCI_DFFC | CART_UCI_DE1C)) &&
+       !(def->require & (CART_UCI | CART_UCI_DFFC | CART_UCI_DE1C))) {
         if (getFpgaCapabilities() & CAPAB_COMMAND_INTF) {
             if (CMD_IF_SLOT_ENABLE) {
                 def->disabled |= CART_UCI;
@@ -1653,10 +1737,11 @@ void C64 :: set_eeprom_data(uint8_t *buffer)
 
 bool C64 :: get_eeprom_dirty(void)
 {
+    // Reading does not clear: the flag stays set until the contents are taken, in
+    // get_eeprom_data() or set_eeprom_data(). Clearing it here lost the change to
+    // whoever looked at it first, which System Info does.
     volatile uint8_t *eeprom = (volatile uint8_t *)(EEPROM_BASE);
-    bool dirty = (*eeprom != 0) ? true : false;
-    *eeprom = 1; // clear dirty flag
-    return dirty;
+    return (*eeprom != 0);
 }
 
 void C64 :: list_crts(ConfigItem *it, IndexedList<char *>& strings)
@@ -1781,6 +1866,8 @@ void C64 :: measure_timing(uint8_t *buffer)
 {
     uint8_t *wp = buffer;
 
+    // Not inside a freeze or an unfreeze: the stop and the resume below must not be theirs.
+    lock_ownership();
     bool i_stopped_it = false;
     if(!is_stopped()) {
         stop(false);
@@ -1857,6 +1944,7 @@ void C64 :: measure_timing(uint8_t *buffer)
     if (i_stopped_it) {
         resume();
     }
+    unlock_ownership();
 }
 
 void C64 :: setup_config_menu(void)
